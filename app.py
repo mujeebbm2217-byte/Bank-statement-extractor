@@ -8,7 +8,16 @@ Deploy free on:      https://share.streamlit.io  (Streamlit Community Cloud)
                       app.py. No server setup needed.
 
 Requires (see requirements.txt):
-    streamlit pandas numpy pdfplumber openpyxl pillow reportlab
+    streamlit pandas numpy pdfplumber openpyxl pillow reportlab pytesseract
+
+OCR (for scanned / image-only PDF statements):
+    - "pytesseract" (Python package) goes in requirements.txt
+    - The Tesseract OCR ENGINE itself must also be installed separately:
+        Windows desktop:  https://github.com/UB-Mannheim/tesseract/wiki
+        Streamlit Cloud:  add a "packages.txt" file next to app.py with
+                           one line:  tesseract-ocr
+      Without the engine, OCR buttons stay visible but will show an error
+      when used -- the rest of the app works normally either way.
 
 -----------------------------------------------------------------------------
 WHAT CHANGED FROM THE DESKTOP (CustomTkinter) VERSION
@@ -63,6 +72,22 @@ try:
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
+
+try:
+    import pytesseract
+    from pytesseract import Output as _TesseractOutput
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
+# ^ OCR needs BOTH the "pytesseract" Python package (in requirements.txt)
+#   AND the Tesseract engine itself installed on the machine/server:
+#     - Windows (desktop use): install from
+#       https://github.com/UB-Mannheim/tesseract/wiki and add it to PATH
+#     - Streamlit Community Cloud: add a file named "packages.txt"
+#       (next to app.py) containing one line:  tesseract-ocr
+#   Without the engine installed, PYTESSERACT_AVAILABLE will still be True
+#   (the Python package imports fine) but OCR calls will raise an error --
+#   we catch that and show a friendly message in the UI.
 
 NONE_OPTION = "-- None --"
 DEVELOPER_NAME = "Mohammad Mujeeb"
@@ -179,7 +204,86 @@ def _extract_pdf_tables_best_strategy(pdf):
     return PDF_TABLE_STRATEGIES[0]
 
 
-def extract_raw_rows(uploaded_file, ext):
+# ----------------------------- OCR (scanned PDFs) -----------------------------
+
+def ocr_image_to_rows(pil_image, min_confidence=40, column_gap_px=25):
+    """
+    Run Tesseract OCR on a page image and reconstruct it as table rows
+    (list of lists), instead of one long unstructured text blob.
+
+    How it works:
+      1. Tesseract returns every recognised WORD with its (x, y) position.
+      2. Words are grouped into lines using Tesseract's own line numbers.
+      3. Within a line, words are joined into the SAME cell unless the gap
+         between two words is wider than `column_gap_px` -- a wide gap
+         usually means "new column" (e.g. Narration ... [big gap] ... Amount).
+
+    `min_confidence` (0-100) drops low-confidence OCR noise (specks, table
+    borders misread as characters). `column_gap_px` may need tuning --
+    increase it if columns are being merged together, decrease it if a
+    single column is being split into two.
+    """
+    if not PYTESSERACT_AVAILABLE:
+        raise RuntimeError(
+            "pytesseract is not installed. Add 'pytesseract' to requirements.txt."
+        )
+
+    data = pytesseract.image_to_data(pil_image, output_type=_TesseractOutput.DICT)
+
+    words = []
+    for i in range(len(data['text'])):
+        text = data['text'][i].strip()
+        if not text:
+            continue
+        try:
+            conf = float(data['conf'][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if conf < min_confidence:
+            continue
+        words.append({
+            'text': text,
+            'left': data['left'][i],
+            'width': data['width'][i],
+            'line_key': (data['block_num'][i], data['par_num'][i], data['line_num'][i]),
+        })
+
+    lines, order = {}, []
+    for w in words:
+        if w['line_key'] not in lines:
+            lines[w['line_key']] = []
+            order.append(w['line_key'])
+        lines[w['line_key']].append(w)
+
+    rows = []
+    for key in order:
+        line_words = sorted(lines[key], key=lambda w: w['left'])
+        cells = []
+        current = [line_words[0]]
+        for prev_w, cur_w in zip(line_words, line_words[1:]):
+            gap = cur_w['left'] - (prev_w['left'] + prev_w['width'])
+            if gap > column_gap_px:
+                cells.append(' '.join(w['text'] for w in current))
+                current = [cur_w]
+            else:
+                current.append(cur_w)
+        cells.append(' '.join(w['text'] for w in current))
+        rows.append(cells)
+
+    return rows
+
+
+def page_needs_ocr(tables, min_rows=2):
+    """A page 'needs OCR' if pdfplumber's normal table extraction found
+    little or nothing -- the classic sign of a scanned/image-only page."""
+    if not tables:
+        return True
+    main_table = max(tables, key=len)
+    real_rows = [r for r in main_table if r and not _is_blank_row(r)]
+    return len(real_rows) < min_rows
+
+
+def extract_raw_rows(uploaded_file, ext, use_ocr=True, force_ocr=False, ocr_resolution=300):
     """
     Extract RAW rows (no header assumption yet) plus optional PDF page
     images for preview. `uploaded_file` is a Streamlit UploadedFile
@@ -187,6 +291,7 @@ def extract_raw_rows(uploaded_file, ext):
     Returns (rows, page_images).
     """
     page_images = []
+    ocr_pages_used = []  # track which page numbers fell back to OCR, for the UI message
 
     if ext == 'pdf':
         rows = []
@@ -194,13 +299,39 @@ def extract_raw_rows(uploaded_file, ext):
         with pdfplumber.open(uploaded_file) as pdf:
             settings = _extract_pdf_tables_best_strategy(pdf)
 
-            for page in pdf.pages:
+            for page_num, page in enumerate(pdf.pages, start=1):
                 try:
                     tables = page.extract_tables(settings)
                 except Exception:
                     tables = []
 
-                if tables:
+                should_ocr = use_ocr and (force_ocr or page_needs_ocr(tables))
+
+                if should_ocr:
+                    try:
+                        ocr_img = page.to_image(resolution=ocr_resolution).original
+                        ocr_rows = ocr_image_to_rows(ocr_img)
+                        if ocr_rows:
+                            rows.extend(ocr_rows)
+                            ocr_pages_used.append(page_num)
+                        elif tables:
+                            # OCR found nothing usable -- fall back to whatever
+                            # the normal table extraction gave us, if anything.
+                            main_table = max(tables, key=len)
+                            for r in main_table:
+                                if r is None or _is_blank_row(r):
+                                    continue
+                                rows.append(list(r))
+                    except Exception:
+                        # OCR engine missing/failed -- fall back silently to
+                        # normal extraction rather than losing the whole page.
+                        if tables:
+                            main_table = max(tables, key=len)
+                            for r in main_table:
+                                if r is None or _is_blank_row(r):
+                                    continue
+                                rows.append(list(r))
+                elif tables:
                     main_table = max(tables, key=len)
                     for r in main_table:
                         if r is None or _is_blank_row(r):
@@ -212,6 +343,8 @@ def extract_raw_rows(uploaded_file, ext):
                     page_images.append(img)
                 except Exception:
                     pass
+
+        st.session_state["_ocr_pages_used"] = ocr_pages_used
         return rows, page_images
 
     uploaded_file.seek(0)
@@ -321,10 +454,10 @@ def guess_header_row(rows, max_scan=40):
 
 # ----------------------------- PDF <-> Excel conversion -----------------------------
 
-def convert_pdf_to_excel_bytes(uploaded_file):
+def convert_pdf_to_excel_bytes(uploaded_file, use_ocr=True, force_ocr=False):
     """Raw dump of every extracted PDF row into an in-memory Excel file.
     Returns (BytesIO, row_count)."""
-    rows, _ = extract_raw_rows(uploaded_file, 'pdf')
+    rows, _ = extract_raw_rows(uploaded_file, 'pdf', use_ocr=use_ocr, force_ocr=force_ocr)
     if not rows:
         raise ValueError("No data could be extracted from this PDF.")
 
@@ -427,14 +560,37 @@ def keyword_search_tab():
         "PDF / Excel / CSV", type=["pdf", "xlsx", "xls", "csv"], key="stmt_upload"
     )
 
+    if not PYTESSERACT_AVAILABLE:
+        st.caption(
+            "ℹ️ OCR (for scanned PDFs) is unavailable -- add 'pytesseract' to "
+            "requirements.txt, and 'tesseract-ocr' to packages.txt if deploying "
+            "on Streamlit Cloud."
+        )
+    ocr_col1, ocr_col2 = st.columns(2)
+    with ocr_col1:
+        use_ocr = st.checkbox(
+            "Auto-OCR scanned pages", value=True, disabled=not PYTESSERACT_AVAILABLE,
+            help="If a PDF page has no readable table (i.e. it's a scanned image), "
+                 "run OCR on it automatically instead of skipping it.",
+        )
+    with ocr_col2:
+        force_ocr = st.checkbox(
+            "Force OCR on every page", value=False,
+            disabled=not (PYTESSERACT_AVAILABLE and use_ocr),
+            help="Use this if a page LOOKS scanned but still returns a messy "
+                 "1-column table instead of being auto-detected.",
+        )
+
     if uploaded is not None and st.session_state.get("_last_upload_name") != uploaded.name:
         # New file selected -> reset the wizard state.
         reset_workflow_state()
         st.session_state["_last_upload_name"] = uploaded.name
         ext = uploaded.name.lower().split('.')[-1]
-        with st.spinner("Extracting rows..."):
+        with st.spinner("Extracting rows... (OCR pages take longer)"):
             try:
-                rows, page_images = extract_raw_rows(uploaded, ext)
+                rows, page_images = extract_raw_rows(
+                    uploaded, ext, use_ocr=use_ocr, force_ocr=force_ocr
+                )
             except Exception as e:
                 st.error(f"Failed to read file: {e}")
                 return
@@ -445,6 +601,9 @@ def keyword_search_tab():
         st.session_state["page_images"] = page_images
         st.session_state["ext"] = ext
         st.session_state["step"] = 1
+        ocr_used = st.session_state.get("_ocr_pages_used") or []
+        if ocr_used:
+            st.info(f"🔎 OCR was used on page(s): {', '.join(str(p) for p in ocr_used)}")
 
     if "raw_rows" not in st.session_state:
         return
@@ -631,10 +790,23 @@ def keyword_search_tab():
 def converter_tab():
     st.subheader("PDF → Excel")
     pdf_file = st.file_uploader("Select PDF to convert", type=["pdf"], key="pdf2xlsx")
+    c_ocr1, c_ocr2 = st.columns(2)
+    with c_ocr1:
+        conv_use_ocr = st.checkbox(
+            "Auto-OCR scanned pages", value=True, disabled=not PYTESSERACT_AVAILABLE,
+            key="conv_use_ocr",
+        )
+    with c_ocr2:
+        conv_force_ocr = st.checkbox(
+            "Force OCR on every page", value=False,
+            disabled=not (PYTESSERACT_AVAILABLE and conv_use_ocr), key="conv_force_ocr",
+        )
     if pdf_file is not None and st.button("Convert to Excel"):
         try:
-            with st.spinner("Converting..."):
-                buf, row_count = convert_pdf_to_excel_bytes(pdf_file)
+            with st.spinner("Converting... (OCR pages take longer)"):
+                buf, row_count = convert_pdf_to_excel_bytes(
+                    pdf_file, use_ocr=conv_use_ocr, force_ocr=conv_force_ocr
+                )
             st.success(f"Converted successfully! {row_count} rows.")
             st.download_button(
                 "Download Excel file", data=buf,
