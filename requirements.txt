@@ -6,10 +6,3 @@ openpyxl
 pillow
 reportlab
 pytesseract
-opencv-python-headless
-paddleocr
-paddlepaddle
-easyocr
-rapidfuzz
-camelot-py
-ghostscript
