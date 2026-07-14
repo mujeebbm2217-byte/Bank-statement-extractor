@@ -627,14 +627,26 @@ def keyword_search_tab():
                         st.image(img, caption=f"Page {i + 1}", use_container_width=True)
 
         max_cols = max((len(r) for r in rows), default=0)
-        preview_n = min(40, len(rows))
-        padded_preview = [pad_row(r, max_cols) for r in rows[:preview_n]]
+        padded_rows = [pad_row(r, max_cols) for r in rows]
         preview_df = pd.DataFrame(
-            padded_preview, columns=[f"Col {i + 1}" for i in range(max_cols)]
+            padded_rows, columns=[f"Col {i + 1}" for i in range(max_cols)]
         )
-        st.dataframe(preview_df, use_container_width=True, height=320)
-        if len(rows) > preview_n:
-            st.caption(f"Showing first {preview_n} of {len(rows)} rows.")
+
+        ocr_used = st.session_state.get("_ocr_pages_used") or []
+        if ocr_used:
+            st.caption(
+                "✏️ **This file used OCR** -- double-click any cell below to fix "
+                "misread amounts/text before continuing (e.g. OCR reading '0' as "
+                "'O', or a digit wrong)."
+            )
+        edited_df = st.data_editor(
+            preview_df, use_container_width=True, height=320,
+            num_rows="fixed", key="raw_rows_editor",
+        )
+        # Push corrections back into `rows` so header selection + everything
+        # downstream uses your fixed values, not the raw OCR output.
+        rows = edited_df.astype(object).where(pd.notna(edited_df), '').values.tolist()
+        st.session_state["raw_rows"] = rows
 
         default_guess = guess_header_row(rows)
         header_idx = st.number_input(
@@ -742,6 +754,23 @@ def keyword_search_tab():
     if st.session_state.get("step") == 3 and "df" in st.session_state:
         df = st.session_state["df"]
         st.success(f"Table ready · {len(df)} rows")
+
+        with st.expander("✏️ Fix wrong amounts before searching (click any cell)", expanded=False):
+            st.caption(
+                "OCR can misread digits (e.g. 5000 read as 5OOO, or a wrong "
+                "decimal). Edit any Reference/Debit/Credit value below -- your "
+                "changes are used for the search and totals."
+            )
+            col_config = {}
+            if 'Debit' in df.columns:
+                col_config['Debit'] = st.column_config.NumberColumn("Debit", format="%.2f")
+            if 'Credit' in df.columns:
+                col_config['Credit'] = st.column_config.NumberColumn("Credit", format="%.2f")
+            df = st.data_editor(
+                df, use_container_width=True, height=320,
+                column_config=col_config, key="final_amounts_editor",
+            )
+            st.session_state["df"] = df
 
         available_cols = [c for c in ['Debit', 'Credit'] if c in df.columns]
 
