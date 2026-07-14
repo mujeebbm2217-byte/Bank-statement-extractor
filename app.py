@@ -1132,7 +1132,7 @@ def keyword_search_tab():
                 cols = st.columns(min(4, len(st.session_state["page_images"])))
                 for i, img in enumerate(st.session_state["page_images"][:8]):
                     with cols[i % len(cols)]:
-                        st.image(img, caption=f"Page {i + 1}", use_container_width=True)
+                        st.image(img, caption=f"Page {i + 1}", width='stretch')
 
         max_cols = max((len(r) for r in rows), default=0)
         padded_rows = [pad_row(r, max_cols) for r in rows]
@@ -1163,7 +1163,7 @@ def keyword_search_tab():
                 "'O', or a digit wrong)."
             )
         edited_df = st.data_editor(
-            preview_df, use_container_width=True, height=320,
+            preview_df, width='stretch', height=320,
             num_rows="fixed", key="raw_rows_editor", column_config=col_config,
         )
         # Push corrections back into `rows` so header selection + everything
@@ -1266,7 +1266,7 @@ def keyword_search_tab():
             )
 
         st.markdown("**Data preview (first 8 rows)**")
-        st.dataframe(df_raw.head(8), use_container_width=True)
+        st.dataframe(df_raw.head(8), width='stretch')
 
         bcol1, bcol2 = st.columns([1, 1])
         with bcol1:
@@ -1318,7 +1318,7 @@ def keyword_search_tab():
                     "likely an OCR misread, please verify."
                 )
                 with st.expander("Show only mismatched rows"):
-                    st.dataframe(df[df['Balance_Check'] == '⚠ Mismatch'], use_container_width=True)
+                    st.dataframe(df[df['Balance_Check'] == '⚠ Mismatch'], width='stretch')
             else:
                 st.success("✅ Balance check passed on all rows -- Previous Balance + Credit - Debit matches throughout.")
 
@@ -1338,7 +1338,7 @@ def keyword_search_tab():
             if 'Balance_Check' in df.columns:
                 col_config['Balance_Check'] = st.column_config.TextColumn("Balance_Check", disabled=True)
             df = st.data_editor(
-                df, use_container_width=True, height=320,
+                df, width='stretch', height=320,
                 column_config=col_config, key="final_amounts_editor",
             )
             st.session_state["df"] = df
@@ -1378,7 +1378,7 @@ def keyword_search_tab():
                     st.markdown(f"**Found {len(amounts)} entries · Total: ₹{amounts.sum():,.2f}**")
 
                     result_table = matches[matches[col] > 0][['Reference', col]]
-                    st.dataframe(result_table, use_container_width=True)
+                    st.dataframe(result_table, width='stretch')
 
                     csv_bytes = result_table.to_csv(index=False).encode('utf-8')
                     st.download_button(
